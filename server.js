@@ -4,10 +4,11 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const BASE = (process.env.TGTV_BASE_URL || "https://livetgtv.lovable.app").replace(/\/+$/, "");
 const ADDON_ID = "community.nuvio.tgtv.live";
-const ADDON_VERSION = "2.0.0";
+const ADDON_VERSION = "2.1.0";
 const cache = new Map();
 const CACHE_MS = 25_000;
 
+app.set("trust proxy", 1);
 app.disable("x-powered-by");
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -17,14 +18,14 @@ app.use((req, res, next) => {
   next();
 });
 
-async function getJson(url) {
+async function getJson(url, { noCache = false } = {}) {
   const key = String(url);
   const cached = cache.get(key);
-  if (cached && Date.now() - cached.at < CACHE_MS) return cached.value;
+  if (!noCache && cached && Date.now() - cached.at < CACHE_MS) return cached.value;
   const response = await fetch(key, { headers: { Accept: "application/json" } });
   if (!response.ok) throw new Error(`TG TV API returned HTTP ${response.status}`);
   const value = await response.json();
-  cache.set(key, { at: Date.now(), value });
+  if (!noCache) cache.set(key, { at: Date.now(), value });
   return value;
 }
 function safeText(v) { return typeof v === "string" ? v.trim() : ""; }
@@ -50,10 +51,10 @@ function guessCategory(name) {
   for (const [category, re] of rules) if (re.test(n)) return category;
   return "General";
 }
-function asMeta(ch, version, logoMap = new Map()) {
+function asMeta(ch, version, logos = new Map()) {
   const id = String(ch.id ?? "");
   const name = safeText(ch.name) || `Channel ${id}`;
-  const logo = safeText(ch.logo) || logoMap.get(name.toLowerCase()) || undefined;
+  const logo = safeText(ch.logo) || logos.get(name.toLowerCase()) || undefined;
   const category = safeText(ch.category) || guessCategory(name);
   return {
     id: `tgtv-${version}:${id}`,
@@ -76,8 +77,28 @@ async function loadV2(q = "") {
 async function logoMap() {
   try {
     const list = await loadV1();
-    return new Map(list.filter(ch => ch.name && ch.logo).map(ch => [String(ch.name).toLowerCase(), String(ch.logo)]));
+    return new Map(list.filter(ch => ch.name && ch.logo)
+      .map(ch => [String(ch.name).toLowerCase(), String(ch.logo)]));
   } catch { return new Map(); }
+}
+function xmlM3uEscape(value) {
+  return String(value ?? "").replace(/&/g, "&amp;").replace(/"/g, "&quot;")
+    .replace(/\r?\n/g, " ").trim();
+}
+function publicOrigin(req) {
+  const configured = process.env.PUBLIC_BASE_URL;
+  if (configured) return configured.replace(/\/+$/, "");
+  const host = req.get("host");
+  const proto = req.get("x-forwarded-proto")?.split(",")[0]?.trim() || req.protocol || "https";
+  return `${proto}://${host}`;
+}
+async function resolveV2Playable(channelId) {
+  // Do not cache this response: TG TV's playable URLs may expire quickly.
+  const data = await getJson(`${BASE}/api/public/v2/channels/${encodeURIComponent(channelId)}`, { noCache: true });
+  const servers = Array.isArray(data.servers) ? data.servers : [];
+  const chosen = servers.find(s => s && typeof s.playable === "string" && /^https:\/\//.test(s.playable));
+  if (!chosen) throw new Error("No playable HTTPS server was returned");
+  return chosen.playable;
 }
 
 app.get("/manifest.json", (_req, res) => {
@@ -85,7 +106,7 @@ app.get("/manifest.json", (_req, res) => {
     id: ADDON_ID,
     version: ADDON_VERSION,
     name: "TG TV Live",
-    description: "V1 and V2 live TV catalogues with search, category metadata, logos, and playback-time stream resolution.",
+    description: "TG TV catalogues for Nuvio-compatible addon clients, plus an M3U playlist for Nuvio Live TV.",
     resources: ["catalog", "meta", "stream"],
     types: ["tv"],
     catalogs: [
@@ -94,6 +115,47 @@ app.get("/manifest.json", (_req, res) => {
     ],
     idPrefixes: ["tgtv-v1:", "tgtv-v2:"]
   });
+});
+
+// Nuvio Enhanced Live TV playlist endpoint. Add this URL in Settings → Integrations → Live TV → Playlists.
+app.get(["/live.m3u", "/live.m3u8"], async (req, res) => {
+  try {
+    const [channels, logos] = await Promise.all([loadV2(), logoMap()]);
+    const origin = publicOrigin(req);
+    const lines = ["#EXTM3U"];
+    for (const ch of channels) {
+      if (ch.id == null) continue;
+      const name = safeText(ch.name) || `Channel ${ch.id}`;
+      const logo = safeText(ch.logo) || logos.get(name.toLowerCase()) || "";
+      const category = safeText(ch.category) || guessCategory(name);
+      const id = `tgtv-v2:${String(ch.id)}`;
+      lines.push(
+        `#EXTINF:-1 tvg-id="${xmlM3uEscape(id)}" tvg-name="${xmlM3uEscape(name)}"${logo ? ` tvg-logo="${xmlM3uEscape(logo)}"` : ""} group-title="${xmlM3uEscape(category)}",${name.replace(/[\r\n]/g, " ")}`,
+        `${origin}/play/${encodeURIComponent(id)}`
+      );
+    }
+    res.setHeader("Content-Type", "audio/x-mpegurl; charset=utf-8");
+    res.setHeader("Content-Disposition", 'inline; filename="tgtv-live.m3u"');
+    res.setHeader("Cache-Control", "no-store");
+    res.send(lines.join("\n") + "\n");
+  } catch (err) {
+    res.status(502).type("text").send(`Could not create TG TV playlist: ${err.message}`);
+  }
+});
+
+// Resolve the latest TG TV V2 URL on every playback attempt, then redirect the Nuvio player to it.
+app.get("/play/:id", async (req, res) => {
+  const parsed = normalizeId(decodeURIComponent(req.params.id));
+  if (!parsed || parsed.version !== "tgtv-v2") {
+    return res.status(400).type("text").send("Invalid TG TV channel ID");
+  }
+  try {
+    const url = await resolveV2Playable(parsed.channelId);
+    res.setHeader("Cache-Control", "no-store");
+    res.redirect(302, url);
+  } catch (err) {
+    res.status(502).type("text").send(`Could not resolve TG TV stream: ${err.message}`);
+  }
 });
 
 app.get("/catalog/tv/:catalogId.json", async (req, res) => {
@@ -105,13 +167,15 @@ app.get("/catalog/tv/:catalogId.json", async (req, res) => {
     const genre = safeText(req.query.genre);
     const [channels, logos] = await Promise.all([v1 ? loadV1(q ? { q } : {}) : loadV2(q), logoMap()]);
     let filtered = channels;
-    if (genre) filtered = filtered.filter(ch => (safeText(ch.category) || guessCategory(ch.name)).toLowerCase() === genre.toLowerCase() || genre.toLowerCase() === "live tv");
+    if (genre) filtered = filtered.filter(ch =>
+      (safeText(ch.category) || guessCategory(ch.name)).toLowerCase() === genre.toLowerCase() ||
+      genre.toLowerCase() === "live tv"
+    );
     res.json({ metas: filtered.map(ch => asMeta(ch, v1 ? "v1" : "v2", logos)) });
   } catch (err) {
     res.status(502).json({ metas: [], error: "Could not load channel catalogue", detail: err.message });
   }
 });
-
 app.get("/meta/tv/:id.json", async (req, res) => {
   const parsed = normalizeId(req.params.id);
   if (!parsed) return res.status(400).json({ meta: null, error: "Invalid channel id" });
@@ -122,13 +186,12 @@ app.get("/meta/tv/:id.json", async (req, res) => {
     res.json({ meta: asMeta(ch, parsed.version === "tgtv-v1" ? "v1" : "v2", logos) });
   } catch (err) { res.status(502).json({ meta: null, error: err.message }); }
 });
-
 app.get("/stream/tv/:id.json", async (req, res) => {
   const parsed = normalizeId(req.params.id);
   if (!parsed) return res.status(400).json({ streams: [], error: "Invalid channel id" });
   try {
     if (parsed.version === "tgtv-v2") {
-      const data = await getJson(`${BASE}/api/public/v2/channels/${encodeURIComponent(parsed.channelId)}`);
+      const data = await getJson(`${BASE}/api/public/v2/channels/${encodeURIComponent(parsed.channelId)}`, { noCache: true });
       const servers = Array.isArray(data.servers) ? data.servers : [];
       const streams = servers.filter(s => s && typeof s.playable === "string" && /^https:\/\//.test(s.playable)).map((s, i) => ({
         name: "TG TV V2", title: safeText(s.label) || `Server ${i + 1}`, url: s.playable,
@@ -136,7 +199,7 @@ app.get("/stream/tv/:id.json", async (req, res) => {
       }));
       return res.json({ streams });
     }
-    const data = await getJson(`${BASE}/api/public/channels/${encodeURIComponent(parsed.channelId)}`);
+    const data = await getJson(`${BASE}/api/public/channels/${encodeURIComponent(parsed.channelId)}`, { noCache: true });
     const sources = Array.isArray(data.sources) ? data.sources : [];
     const streams = sources.filter(url => typeof url === "string" && /^https:\/\//.test(url)).map((url, i) => ({
       name: "TG TV V1", title: `Source ${i + 1}${data.drm?.type ? " · DRM may be required" : ""}`, url,
@@ -148,5 +211,5 @@ app.get("/stream/tv/:id.json", async (req, res) => {
   }
 });
 app.get("/health", (_req, res) => res.json({ ok: true, version: ADDON_VERSION }));
-app.get("/", (_req, res) => res.type("text").send("TG TV Live addon is running. Open /manifest.json to install it in a compatible Nuvio client."));
-app.listen(PORT, () => console.log(`TG TV Live addon v${ADDON_VERSION} listening on ${PORT}`));
+app.get("/", (_req, res) => res.type("text").send("TG TV Live service is running. Use /live.m3u for Nuvio Live TV or /manifest.json for the addon."));
+app.listen(PORT, () => console.log(`TG TV Live v${ADDON_VERSION} listening on ${PORT}`));
