@@ -1,0 +1,10 @@
+{
+  "name": "nuvio-tgtv-live-addon",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Nuvio/Stremio-compatible addon for TG TV V2 public 24/7 HLS channel catalogue",
+  "type": "module",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "express": "^4.21.2" }
+}
